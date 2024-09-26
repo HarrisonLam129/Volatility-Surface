@@ -97,7 +97,7 @@ class YieldCurve:
             yield_text_file = open(location + '_yield_data.txt', 'w')
             self.refresh_yield_data(location, yield_text_file, self.function_indices[num])
 
-    def get_refresh_date(self):
+    def return_refresh_date(self):
         return self.refresh_date
 
 
@@ -178,7 +178,7 @@ class InterestRateProcess:
         us_data_file = open('US_data.txt', 'w')
         self.refresh_spot_data(us_data_file)
 
-    def get_refresh_date(self):
+    def return_refresh_date(self):
         return self.refresh_date
 
     def get_yield_spline(self):
@@ -194,6 +194,7 @@ class OptionsData:
         self.expiration_years = None
         self.options = None
         self.refresh_date = None
+        self.forward = []
         self.refresh(load)
 
     def compute_iv(self, df, market):
@@ -211,7 +212,7 @@ class OptionsData:
 
         def newton_raphson(row, price_type='mid'):
             target_error = 10 ** (-5)
-            r = yield_spline(row['T']) / 100
+            r = math.log(row['forward']/self.spot)/row['T']
             guess = math.sqrt(abs(2 * r + 2 * math.log(self.spot / row['strike']) / row['T']))
             if row['type'] in ['Call', 'Put']:
                 if price_type == 'mid':
@@ -230,11 +231,6 @@ class OptionsData:
             else:
                 return None
         if market:
-            df = df.dropna(subset=['bid', 'ask'])
-            if len(df[(df['bid'] != 0) & (df['ask'] != 0)].index) != 0:
-                df = df[(df['bid'] != 0) & (df['ask'] != 0)]
-            else:
-                df = df[(df['bid'] != 0) & (df['ask'] != 0)]
             df.loc[:, 'VolImp'] = df.apply(lambda x: newton_raphson(x, 'mid'), axis=1)
         else:
             df.loc[:, 'SmoothVolImp'] = df.apply(lambda x: newton_raphson(x, 'smoothed'), axis=1)
@@ -246,8 +242,11 @@ class OptionsData:
     def return_options_expirations(self):
         return self.expirations, self.expiration_years
 
-    def get_refresh_date(self):
+    def return_refresh_date(self):
         return self.refresh_date
+    
+    def return_forward(self):
+        return self.forward
 
     def refresh(self, load):
         self.options = []
@@ -268,6 +267,7 @@ class OptionsData:
             self.expiration_years = [float(elem) for elem in lines[1].split(',')]
             self.refresh_date = datetime(*[int(elem) for elem in lines[2].split('-')])
             self.spot = float(lines[3])
+            self.forward = [float(elem) for elem in lines[4].split(',')]
             expiration_file.close()
             for expiration in self.expirations:
                 df = pd.read_pickle('options/' + expiration.strip())
@@ -284,51 +284,90 @@ class OptionsData:
         self.spot = self.spx.history()['Close'].iloc[-1]
         self.expirations = list(self.spx.options)
         temp = []
+        def put_to_call(row):
+            if row['type'] == 'Call':
+                return (row['bid'] + row['ask']) / 2
+            else:
+                return (row['bid'] + row['ask']) / 2 + self.spot - row['strike'] * self.spot/row['forward']
         with tqdm(total=len(self.expirations)) as progress_bar:
             for expiration in self.expirations:
-                # SPX options typically settle at 3pm on expiry date
-                time_to_expiry = (datetime(*([int(elem) for elem in expiration.split('-')] + [15, 0, 0])) -
-                                  datetime.today())
                 current = self.spx.option_chain(expiration)
                 calls = current.calls
                 calls.insert(0, 'type', 'Call')
                 puts = current.puts
                 puts.insert(0, 'type', 'Put')
                 df = pd.concat([calls, puts], ignore_index=True)
-                df['lastTradeDate'] = df['lastTradeDate'].apply(lambda x:
-                                                                x.tz_convert(tz='Asia/Hong_Kong').replace(tzinfo=None))
-                df = df[(df['lastTradeDate'].apply(lambda x: (datetime.today()-x).days <= 5)) & df['volume'] > 0]
-                # 12 hours = 1/2 day difference between time zones
-                T = (time_to_expiry.days + 1 / 2 + time_to_expiry.seconds / 86400) / 365.2425
-                df['T'] = T
-                # 0.003 years = 1 day
-                if len(df.index) > 5 and df['T'].iloc[0] > 0.003:
-                    df['logMoneyness'] = np.log(df['strike'] / (self.spot * math.exp(T * yield_spline(T)/100)))
-                    df = df[((df['type'] == 'Call') & (df['logMoneyness'] > 0)) |
-                            ((df['type'] == 'Put') & (df['logMoneyness'] < 0))]
-                    df = df[(df['logMoneyness'] > -0.8) & (df['logMoneyness'] < 0.4)]
-                    #df = df[df['ask']/df['bid'] <= 1.05]
-                    df = self.compute_iv(df, True).sort_values(by=['logMoneyness'], ignore_index=True)
-                    df['TV'] = (df['VolImp'] ** 2) * df['T']
-                    def put_to_call(row):
-                        if row['type'] == 'Call':
-                            return (row['bid']+row['ask'])/2
-                        else:
-                            return (row['bid']+row['ask'])/2+self.spot-row['strike']*math.exp(-T * yield_spline(T)/100)
-                    if len(df.index) >= 4:
-                        df['CallPrice'] = df.apply(put_to_call, axis=1)
-                        temp.append(expiration)
-                        self.expiration_years.append(T)
-                        self.options.append(df)
-                        df.to_pickle('options/' + expiration)
+                df['lastTradeDate'] = df['lastTradeDate'].apply(lambda x: x.replace(tzinfo=None))
+                df = df[(df['lastTradeDate'].apply(lambda x: (datetime.today()-x).days <= 3)) & df['volume'] > 0]
+                df = df[(df['bid'] != 0) & (df['ask'] != 0)]
+                df.drop(columns=['change', 'percentChange', 'volume', 'impliedVolatility',
+                                 'inTheMoney', 'contractSize', 'currency', 'openInterest'], inplace=True)
+                # SPX options typically settle at 4pm on expiry date
+                time_to_expiry = (datetime(*([int(elem) for elem in expiration.split('-')] + [16, 0, 0])) -
+                                  datetime.today())
+                # 5 hours difference between time zones
+                Ts = [(time_to_expiry.days + 5/24 - 6.5/24 + time_to_expiry.seconds/86400) / 365.2425,
+                      (time_to_expiry.days + 5/24 + time_to_expiry.seconds / 86400) / 365.2425]
+                if len(df.index) == 0:
+                    progress_bar.update(1)
+                    continue
+                weekly = df[df['contractSymbol'].str.contains('W')]
+                monthly = df[~df['contractSymbol'].str.contains('W')]
+                for i, df in enumerate([monthly, weekly]):
+                    if len(df.index) == 0:
+                        continue
+                    T = Ts[i]
+                    # 0.003 years = 1 day
+                    if T > 0.003 and len(df[df['type'] == 'Call'].index) >= 2 and len(df[df['type'] == 'Put'].index) >= 2:
+                        df['T'] = T
+                        # Estimate forward price using intersections
+                        c, p = df[df['type'] == 'Call'], df[df['type'] == 'Put']
+                        l = max(c['strike'].min(), p['strike'].min())
+                        r = min(c['strike'].max(), p['strike'].max())
+                        xs = np.linspace(l, r, 2500)
+                        i1, i2 = 0, 0
+                        pa, pb, ca, cb = np.array([]), np.array([]), np.array([]), np.array([])
+                        for x in xs:
+                            while i1+2 < len(c.index) and x > c['strike'].iloc[i1+1]:
+                                i1 += 1
+                            while i2+2 < len(p.index) and x > p['strike'].iloc[i2+1]:
+                                i2 += 1
+                            pa = np.append(pa, p['ask'].iloc[i2] + (x-p['strike'].iloc[i2])*
+                                           (p['ask'].iloc[i2+1]-p['ask'].iloc[i2])/(p['strike'].iloc[i2+1]-p['strike'].iloc[i2]))
+                            pb = np.append(pb, p['bid'].iloc[i2] + (x-p['strike'].iloc[i2])*
+                                           (p['bid'].iloc[i2+1]-p['bid'].iloc[i2])/(p['strike'].iloc[i2+1]-p['strike'].iloc[i2]))
+                            ca = np.append(ca, c['ask'].iloc[i1] + (x-c['strike'].iloc[i1])*
+                                           (c['ask'].iloc[i1+1]-c['ask'].iloc[i1])/(c['strike'].iloc[i1+1]-c['strike'].iloc[i1]))
+                            cb = np.append(cb, c['bid'].iloc[i1] + (x-c['strike'].iloc[i1])*
+                                           (c['bid'].iloc[i1+1]-c['bid'].iloc[i1])/(c['strike'].iloc[i1+1]-c['strike'].iloc[i1]))
+                        idx1 = np.argwhere(np.diff(np.sign(pa-cb))).flatten()
+                        idx2 = np.argwhere(np.diff(np.sign(pb-ca))).flatten()
+                        if len(idx1) > 0 and len(idx2) > 0:
+                            forward_price = (xs[idx1[0]] + xs[idx2[0]])/2
+                            if len(self.forward) == 0 or forward_price >= self.forward[-1]:
+                                df['forward'] = forward_price
+                                df['logMoneyness'] = np.log(df['strike'] / forward_price)
+                                df = df[(df['logMoneyness'] > -0.8) & (df['logMoneyness'] < 0.4)]
+                                df = df[((df['logMoneyness'] <= 0) & (df['type'] == 'Put')) |
+                                        ((df['logMoneyness'] > 0) & (df['type'] == 'Call'))]
+                                df = self.compute_iv(df, True).sort_values(by=['logMoneyness'], ignore_index=True)
+                                df['CallPrice'] = df.apply(put_to_call, axis=1)
+                                if len(df.index) >= 5:
+                                    self.forward.append(forward_price)
+                                    temp.append(expiration + ('M' if i == 0 else 'W'))
+                                    self.expiration_years.append(T)
+                                    self.options.append(df)
+                                    df.to_pickle('options/' + expiration + ('M' if i == 0 else 'W'))
                 progress_bar.update(1)
+
         print(str(len(self.expirations)-len(self.options)) + ' maturities dropped')
         self.expirations = temp
         self.refresh_date = datetime.today()
         expiration_file.write(','.join(self.expirations) + '\n')
         expiration_file.write(','.join([str(elem) for elem in self.expiration_years]) + '\n')
         expiration_file.write(self.refresh_date.strftime('%Y-%m-%d-%H-%M-%S') + '\n')
-        expiration_file.write(str(self.spot))
+        expiration_file.write(str(self.spot) + '\n')
+        expiration_file.write(','.join([str(elem) for elem in self.forward]))
         expiration_file.close()
 
     def return_spot(self):
@@ -341,12 +380,16 @@ class SmoothPrices:
         self.dfs = dfs[::-1]
         self.g, self.second, self.h = [], [], []
         self.spot = spot
+        non_convex = 0
         for i, df in enumerate(self.dfs):
             df['strike2'] = df['strike'].shift(1)
             g, second, h = self.smooth_prices(df, i)
             self.g.append(g)
             self.second.append(second)
             self.h.append(h)
+            if min(second) < 0:
+                non_convex += 1
+        print(str(non_convex) + ' non-convex curves out of ' + str(len(self.dfs)) + ' maturities')
 
     def return_smoothed_price(self, index, xs):
         def price(index, x, start):
@@ -367,6 +410,29 @@ class SmoothPrices:
         ys = []
         for x in xs:
             y, interval = price(index, x, i)
+            ys.append(y)
+            i = interval
+        return ys
+
+    def return_rnd(self, index, xs):
+        def convexity(index, x, start):
+            strikes = self.dfs[index]['strike'].iloc[1:-1]
+            i = start
+            g, second, h = self.g[index], self.second[index], self.h[index]
+            if x < strikes.iloc[0] or x > strikes.iloc[-1]:
+                return None, i
+            while x > strikes.iloc[i + 1]:
+                i += 1
+            prev, after = strikes.iloc[i], strikes.iloc[i + 1]
+            y = (((x-prev) * g[i+1] + (after-x) * g[i]) / h[i] -
+                 (1/6) * (x-prev) * (after-x) * (
+                         (1 + (x-prev)/h[i])*second[i + 1] + (1+(after-x)/h[i])*second[i]))
+            return y, i
+
+        i = 0
+        ys = []
+        for x in xs:
+            y, interval = convexity(index, x, i)
             ys.append(y)
             i = interval
         return ys
@@ -396,9 +462,9 @@ class SmoothPrices:
                        np.concatenate((np.zeros((1, n-1)), [[-1]], np.zeros((1, n-2))), axis=1)))
         l = np.hstack((np.zeros(n-2),
                        np.zeros(n-2),
-                       [math.exp(-T * yield_spline(T)/100),
+                       [self.spot/df['forward'].iloc[0],
                         0,
-                        -self.spot + df['strike'].iloc[1] * math.exp(-T * yield_spline(T)/100),
+                        -self.spot + df['strike'].iloc[1] * self.spot/df['forward'].iloc[0],
                         -0.01]))
         if i == 0:
             G = np.vstack((G,
@@ -408,8 +474,7 @@ class SmoothPrices:
             cones = [clarabel.ZeroConeT(n-2),
                      clarabel.NonnegativeConeT(n+3)]
         else:
-            T1 = self.dfs[i - 1]['T'].iloc[0]
-            rate = math.exp(-T * yield_spline(T)/100 + T1*yield_spline(T1)/100)
+            rate = self.dfs[i-1]['forward'].iloc[0]/df['forward'].iloc[0]
             G = np.vstack((G,
                            np.hstack((np.eye(n), np.zeros((n, n-2))))))
             cones = [clarabel.ZeroConeT(n-2),
@@ -475,7 +540,7 @@ def refresh_yield(lines):
         if not line.get_visible():
             plot_toggle_button.set_active(i)
     rescale_figure_range(main_ax1)
-    refresh1.config(text=yield_curve.get_refresh_date().strftime('Last updated \n' + '%Y-%m-%d %H:%M:%S'))
+    refresh1.config(text=yield_curve.return_refresh_date().strftime('Last updated \n' + '%Y-%m-%d %H:%M:%S'))
 
 
 def refresh_interest(lines):
@@ -484,7 +549,7 @@ def refresh_interest(lines):
     lines[0].set_xdata(new_data[0])
     lines[0].set_ydata(new_data[1])
     rescale_figure_range(main_ax2)
-    refresh2.config(text=interest_process_US.get_refresh_date().strftime('Last updated \n' + '%Y-%m-%d %H:%M:%S'))
+    refresh2.config(text=interest_process_US.return_refresh_date().strftime('Last updated \n' + '%Y-%m-%d %H:%M:%S'))
     refresh_options()
 
 
@@ -507,7 +572,7 @@ def refresh_options():
     l2 = [main_ax3.plot(smoothed_dfs[i]['strike'], smoothed_dfs[i]['smoothed'], c='red',
                         linewidth=1.5, visible=bool(i == 0))[0]
           for i in range(len(expirations))]
-    l3 = [main_ax3.axvline(x=spot * math.exp(T * yield_spline(T) / 100), linestyle='--',
+    l3 = [main_ax3.axvline(x=forward[i], linestyle='--',
                            visible=bool(i == 0)) for i, T in enumerate(expiration_years)]
     lines = [l1, l2, l3]
     global white_patch, price_vol, strike_moneyness
@@ -534,7 +599,7 @@ def refresh_options():
     surf = main_ax4.plot_surface(x_grid, y_grid, z_grid, rstride=1, cstride=1, cmap=cm.hsv)
     main_ax4.view_init(20, 230)
     fig4.canvas.draw_idle()
-    refresh3.config(text=options_data.get_refresh_date().strftime('Last updated \n' + '%Y-%m-%d %H:%M:%S'))
+    refresh3.config(text=options_data.return_refresh_date().strftime('Last updated \n' + '%Y-%m-%d %H:%M:%S'))
 
 
 def change_maturity(lines):
@@ -556,9 +621,13 @@ def return_smoothed_dfs(smoother, N):
             xs = np.linspace(df['strike'].min(), df['strike'].max(), N)
             ys = smoother.return_smoothed_price(len(smoother.dfs)-1-i, xs)
             T = df['T'].iloc[0]
-            smoothed_df = pd.DataFrame(data={'strike': xs, 'smoothed': ys, 'T': T}).dropna(subset=['smoothed'])
-            smoothed_df['logMoneyness'] = np.log(smoothed_df['strike'] / (spot * math.exp(T * yield_spline(T) / 100)))
-            smoothed_df['type'] = 'Call'
+            forward = df['forward'].iloc[0]
+            smoothed_df = pd.DataFrame(data={'strike': xs,
+                                             'smoothed': ys,
+                                             'T': T,
+                                             'forward': forward,
+                                             'logMoneyness': np.log(xs / forward),
+                                             'type': 'Call'}).dropna(subset=['smoothed'])
             smoothed_df = options_data.compute_iv(smoothed_df, False)
             non_converging += smoothed_df[smoothed_df['SmoothVolImp'] == None].shape[0]
             total += smoothed_df.shape[0]
@@ -612,8 +681,7 @@ def strike_moneyness_switch():
         strike_moneyness_switch_button.config(image=slider_off2)
         x_key = 'strike'
         for i, l in enumerate(l3):
-            T = options_expiration_years[i]
-            l.set_xdata([spot * math.exp(T * yield_spline(T) / 100)])
+            l.set_xdata([forward[i]])
         white_patch.set_label('Forward Price')
     main_ax3.legend(handles=[yellow_patch, red_patch, white_patch])
     new_l1 = [main_ax3.scatter(options_df[i][x_key], options_df[i][y_key], c='yellow',
@@ -684,7 +752,7 @@ main_ax1 = fig1.add_axes((0.08, 0.18, 0.75, 0.65))
 canvas1 = FigureCanvasTkAgg(fig1, master=frame1)
 canvas1.get_tk_widget().place(relx=0.005, rely=0.01, relwidth=0.99, relheight=0.98)
 refresh1 = ttk.Label(master=frame1,
-                     text=yield_curve.get_refresh_date().strftime('Last updated \n' + '%Y-%m-%d %H:%M:%S'),
+                     text=yield_curve.return_refresh_date().strftime('Last updated \n' + '%Y-%m-%d %H:%M:%S'),
                      foreground='white', background='black', justify='center')
 refresh1.place(relx=0.815, rely=0.87, relwidth=0.18, relheight=0.12)
 
@@ -729,7 +797,7 @@ fig2.subplots_adjust(bottom=0.2, top=0.8)
 canvas2 = FigureCanvasTkAgg(fig2, master=frame2)
 canvas2.get_tk_widget().place(relx=0.005, rely=0.01, relwidth=0.99, relheight=0.98)
 refresh2 = ttk.Label(master=frame2,
-                     text=interest_process_US.get_refresh_date().strftime('Last updated \n' + '%Y-%m-%d %H:%M:%S'),
+                     text=interest_process_US.return_refresh_date().strftime('Last updated \n' + '%Y-%m-%d %H:%M:%S'),
                      foreground='white', background='black', justify='center')
 refresh2.place(relx=0.815, rely=0.87, relwidth=0.18, relheight=0.12)
 interest_data = interest_process_US.return_us_data()
@@ -757,6 +825,7 @@ options_data = OptionsData('^SPX', load=True)
 options_df = options_data.return_options_data()
 options_expirations, options_expiration_years = options_data.return_options_expirations()
 spot = options_data.return_spot()
+forward = options_data.return_forward()
 smoother = SmoothPrices(options_df, spot)
 smoothed_dfs, non_converging, total = return_smoothed_dfs(smoother, N=100)
 print(str(non_converging) + ' non-converging solutions out of ' + str(total) + ' data points')
@@ -777,7 +846,7 @@ if len(options_expirations) > 0:
     smoothed_price_lines = [main_ax3.plot(smoothed_dfs[i]['strike'], smoothed_dfs[i]['smoothed'], c='red',
                                           linewidth=1.5, visible=bool(i == 0))[0]
                             for i in range(len(options_expirations))]
-    forward_lines = [main_ax3.axvline(x=spot * math.exp(T * yield_spline(T) / 100), linestyle='--', linewidth=0.5,
+    forward_lines = [main_ax3.axvline(x=forward[i], linestyle='--', linewidth=0.5,
                                       visible=bool(i == 0)) for i, T in enumerate(options_expiration_years)]
 
     yellow_patch = mpl_patches.Patch(color='yellow', label='Market')
@@ -813,7 +882,7 @@ refresh_button3 = ttk.Button(master=frame3, image=refresh_icon, style='WhiteButt
                              command=refresh_options)
 refresh_button3.place(relx=0.002, rely=0.91, relwidth=0.019, relheight=0.08)
 refresh3 = ttk.Label(master=frame3,
-                     text=options_data.get_refresh_date().strftime('Last updated \n' + '%Y-%m-%d %H:%M:%S'),
+                     text=options_data.return_refresh_date().strftime('Last updated \n' + '%Y-%m-%d %H:%M:%S'),
                      foreground='white', background='black', justify='center')
 refresh3.place(relx=0.88, rely=0.86, relwidth=0.1, relheight=0.12)
 
